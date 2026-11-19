@@ -1,21 +1,43 @@
-# Lab Report: Project Phase 1 - Starter Audit
+# AI53 MLOps Project Phase 1 - Lab Report
 
-## Starter Codebase Audit
+## Milestone 0 - Starter audit
 
-| File / Setting | Issue / Problem | Suggested Fix |
-| :--- | :--- | :--- |
-| `src/reproducibility.py` | Seeds are not set for Python `random`, `numpy`, or `torch`[cite: 5, 6]. | Implement `set_seed()` to set seeds for `random`, `numpy`, PyTorch CPU, and CUDA[cite: 6]. |
-| `src/validate_data.py` | `validate_dataset()` is incomplete/missing data checks[cite: 7]. | Implement full checks for split existence, class names, image counts, and corrupted files[cite: 7]. |
-| `src/provenance.py` | Run manifest generator is incomplete/missing system tracking[cite: 10]. | Write metadata collector using `platform`, `importlib`, and `subprocess`[cite: 10]. |
-| `src/train.py` | MLflow logging functions and dataset input logging are incomplete[cite: 10, 11]. | Add MLflow run initialization, metric tracking per epoch, artifact logging, and model logging[cite: 10, 11]. |
-| `dvc.yaml` | The pipeline definition file `dvc.yaml` does not exist at the project root yet[cite: 8]. | Define the 4 stages (`validate`, `prepare`, `train`, `evaluate`) in `dvc.yaml`[cite: 8, 9]. |
-| `params.yaml` | Parameters need verification for downstream pipeline stages[cite: 5, 8]. | Ensure hyperparameters (learning rate, batch size, seed) are explicitly referenced by pipeline steps[cite: 8, 9]. |
+| # | File / setting | Problem | Suggested fix |
+| :- | :--- | :--- | :--- |
+| 1 | `src/reproducibility.py` | Only Python `random` is seeded. NumPy, PyTorch (CPU/CUDA), cuDNN, the DataLoader shuffle generator and worker seeds are left uncontrolled, so weight initialisation and batch order change between runs. | Seed every generator in `set_reproducibility()`, return a seeded `torch.Generator` from `make_generator()` and seed NumPy/`random` in `seed_worker()`. Check with `tests/test_reproducibility.py`. |
+| 2 | `src/validate_data.py` | `validate_dataset()` raises `NotImplementedError`: there is no quality gate, so a missing split, an extra class, a wrong count or a corrupt JPEG would only be discovered (or silently ignored) during training. | Check splits, classes, exact counts, full pixel decoding and empty classes; raise on failure and write a deterministic `reports/data_quality.json`. |
+| 3 | `data/raw/` + `.gitignore` | The images are ignored by Git and not tracked by anything else, so the exact data version used by a run cannot be recovered. | Track `data/raw` with DVC, commit `data/raw.dvc`, and push the images to a DVC remote. |
+| 4 | `dvc.yaml` (missing) | There is no pipeline: the order VALIDATE → PREPARE → TRAIN/EVALUATE, and the files/params each step uses, exist only in people's heads. `prepare.py` even says it "must depend on the successful data-quality report" but nothing enforces it. | Write a four-stage `dvc.yaml` with explicit `deps`, `params`, `outs` and `metrics`; commit `dvc.lock`. |
+| 5 | `src/provenance.py` | `build_run_manifest()` is not implemented, so a run records no Git commit, dirty flag, package versions, platform or data identity. | Collect Git SHA + `git status --porcelain`, `training_data_identity()`, library versions via `importlib.metadata`, platform/CUDA and the run settings. |
+| 6 | `src/train.py` | An MLflow Run is opened but nothing is logged (no params, metrics, dataset, artifacts or model). The only result is `models/model.pt`, which is overwritten by every run, so there is no run history to compare. | Log params, per-epoch metrics, the dataset input, report artifacts and the `bean-cnn` model with signature and metadata. |
+| 7 | `params.yaml` → `selection.run_id: ""` | No model has been selected and nothing prevents someone from evaluating several candidates on the test set and picking the best one (test-set leakage). | Choose a Run using validation metrics only, freeze its ID in `selection.run_id`, and run EVALUATE once. |
+| 8 | `params.yaml` → `compute.device: "auto"` | The same config can run on CPU on one machine and CUDA on another, which changes numerics and timings. | Record the resolved device in the manifest/MLflow params (and pin `cpu` for this lab if comparing runs across machines). |
+| 9 | `mlflow.db`, `mlartifacts/` in `.gitignore` | The Run history lives only on the local machine; it is neither in Git nor in DVC. | Keep and back up `mlflow.db` + `mlartifacts/` for Phase 2; record the selected Run ID in Git. |
 
----
+### Engineering checkpoint 1
 
-## Engineering Checkpoint 1
+**Why is a working `model.pt` insufficient evidence that an experiment is reproducible?**
 
-**Question:** Why is a working `model.pt` insufficient evidence that an experiment is reproducible?
+`model.pt` only contains the result (weights and a few settings). It does not say which code commit produced it, which exact images and preprocessing were used, which package versions and hardware ran it, which seed and hyperparameters were set, or what validation scores it reached. It is also overwritten by every training run. Without that provenance nobody can rebuild the same model or check that the reported scores belong to that file.
 
-**Answer:** A `model.pt` file only contains the trained model weights, not the process used to produce them. It lacks the exact code version (Git commit), software package dependencies (`pyproject.toml`/`uv.lock`), random seeds, data split manifests, and hyperparameter configuration[cite: 4, 10]. Without recording these parameters and environmental factors, another developer cannot recreate the exact same model weights from scratch[cite: 1, 4].
+## Milestone 1 - Repeatable training
 
+**`pyproject.toml`** declares the project's direct dependencies and the allowed version ranges (for example `torch>=2.10,<2.12`), the Python range and the CPU PyTorch index. **`uv.lock`** pins the exact resolved version and hash of every package, including transitive ones, so `uv sync --locked` installs the same environment on every machine. **`.venv/`** is the local virtual environment that uv builds from the lock file; it is machine-specific, is not committed, and can always be recreated.
+
+Changes in `src/reproducibility.py`:
+
+- `set_reproducibility()` seeds Python `random`, NumPy, `torch.manual_seed` (CPU) and `torch.cuda.manual_seed_all` when CUDA is available, and sets `cudnn.deterministic=True`, `cudnn.benchmark=False`.
+- `make_generator()` returns a `torch.Generator` seeded with `random_state`, used for DataLoader shuffling.
+- `seed_worker()` seeds NumPy and `random` in each worker from `torch.initial_seed() % 2**32`.
+
+```text
+$ uv run --locked pytest -q tests/test_reproducibility.py
+...                                                                      [100%]
+3 passed
+```
+
+### Engineering checkpoint 2
+
+**Does `random_state=42` guarantee bit-for-bit identical results on every CPU/GPU/software stack?**
+
+No. The seed fixes the sequence of random numbers, but floating-point results also depend on the hardware, the kernels chosen (CPU vector instructions, cuDNN algorithms, non-deterministic GPU atomics), thread counts and the exact PyTorch/CUDA/driver versions. The seed gives repeatable results on the same machine and locked environment; across different stacks you should expect small numerical differences.
