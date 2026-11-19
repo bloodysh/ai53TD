@@ -41,3 +41,24 @@ $ uv run --locked pytest -q tests/test_reproducibility.py
 **Does `random_state=42` guarantee bit-for-bit identical results on every CPU/GPU/software stack?**
 
 No. The seed fixes the sequence of random numbers, but floating-point results also depend on the hardware, the kernels chosen (CPU vector instructions, cuDNN algorithms, non-deterministic GPU atomics), thread counts and the exact PyTorch/CUDA/driver versions. The seed gives repeatable results on the same machine and locked environment; across different stacks you should expect small numerical differences.
+
+## Milestone 2 - Data versioning
+
+I used Option A (the included archives). The checksums were verified and the images were extracted into `data/raw/`.
+
+```text
+$ uv run --locked python scripts/check_dataset.py
+[train]       angular_leaf_spot 345 | bean_rust 348 | healthy 341 | TOTAL 1034 (expected 1034)
+[validation]  angular_leaf_spot  44 | bean_rust  45 | healthy  44 | TOTAL  133 (expected 133)
+[test]        angular_leaf_spot  43 | bean_rust  43 | healthy  42 | TOTAL  128 (expected 128)
+```
+
+`data/raw.dvc` records `nfiles: 1296`, one more than the 1,295 images. The extra file is `train/healthy/healthy_train.120tore`, a macOS `.DS_Store` file (6,148 bytes) that is part of the original `train.zip`. It explains why the iBean repository reports 1,296 files. It is kept so that `data/raw` matches the published archive exactly; the validator and `prepare.py` ignore it because they only read `.jpg/.jpeg/.png`.
+
+DVC remote: `lab-data` → `../ai53-phase1-dvc-storage` (default).
+
+### Engineering checkpoint 3
+
+- **Git remote (GitHub)** stores the code, configuration, report and the small DVC pointer files (`data/raw.dvc`, later `dvc.yaml`/`dvc.lock`) together with the commit history.
+- **DVC remote** (`../ai53-phase1-dvc-storage`) stores the actual image files and other large outputs, addressed by their content hash.
+- **`git push` does not transfer the raw images**; it only pushes `data/raw.dvc`. The images reach the DVC remote only through `dvc push`.
